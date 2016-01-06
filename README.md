@@ -11,7 +11,7 @@ https://github.com/woothee/woothee
 
 ```
 % git clone --depth=1 https://github.com/kjdev/apache-mod-woothee.git
-% cd apache-mod-fwoothee
+% cd apache-mod-woothee
 % ./autogen.sh # OR autoreconf -i
 % ./configure [OPTION]
 % make
