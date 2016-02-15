@@ -16,7 +16,7 @@
  */
 
 /*
- * mod_woothee.c: Add/append HTTP request headers by Woothee
+ * mod_woothee.c: Add requsest note and HTTP request headers by Woothee
  *
  * The RequestHeaderForWoothee directive can be used to add
  * HTTP headers before a request message is processed.
@@ -24,6 +24,9 @@
  *
  * Syntax is:
  *
+ *   WootheeEnable On
+ *
+ *   RequestHeaderForWootheeEnable On
  *   RequestHeaderForWoothee action header item
  *
  * Where action is one of:
@@ -88,6 +91,8 @@ typedef struct {
  * a per-dir and per-server config
  */
 typedef struct {
+  int notes_enable;
+  int header_enable;
   apr_array_header_t *fixup_in;
 } woothee_conf;
 
@@ -106,6 +111,8 @@ create_woothee_dir_config(apr_pool_t *p, char *d)
 {
   woothee_conf *conf = apr_pcalloc(p, sizeof(*conf));
 
+  conf->notes_enable = 0;
+  conf->header_enable = 0;
   conf->fixup_in = apr_array_make(p, 2, sizeof(header_entry));
 
   return conf;
@@ -118,6 +125,8 @@ merge_woothee_config(apr_pool_t *p, void *basev, void *overridesv)
   woothee_conf *base = basev;
   woothee_conf *overrides = overridesv;
 
+  newconf->notes_enable = overrides->notes_enable;
+  newconf->header_enable = overrides->header_enable;
   newconf->fixup_in = apr_array_append(p, base->fixup_in,
                                        overrides->fixup_in);
 
@@ -206,6 +215,26 @@ header_inout_cmd(cmd_parms *cmd, void *indirconf,
 
 /* Handle directives */
 static const char *
+notes_set(cmd_parms *cmd, void *indirconf, int arg)
+{
+  woothee_conf *dirconf = indirconf;
+
+  dirconf->notes_enable = arg;
+
+  return NULL;
+}
+
+static const char *
+header_set(cmd_parms *cmd, void *indirconf, int arg)
+{
+  woothee_conf *dirconf = indirconf;
+
+  dirconf->header_enable = arg;
+
+  return NULL;
+}
+
+static const char *
 header_cmd(cmd_parms *cmd, void *indirconf, const char *args)
 {
   const char *action;
@@ -274,124 +303,144 @@ do_woothee_fixup(request_rec *r, apr_table_t *headers,
                  apr_array_header_t *fixup, int early)
 {
   int i;
-  const char *val;
-
+  const char *val, *ua;
+  woothee_conf *conf;
   woothee_t *woothee = NULL;
-  const char *ua = apr_table_get(headers, "User-Agent");
+
+  ua = apr_table_get(headers, "User-Agent");
   if (ua != NULL) {
     woothee = woothee_parse(ua);
   }
+  if (!woothee) {
+    return 1;
+  }
 
-  for (i = 0; i < fixup->nelts; ++i) {
-    header_entry *hdr = &((header_entry *) (fixup->elts))[i];
-    const char *envar = hdr->condition_var;
+  conf = ap_get_module_config(r->per_dir_config, &woothee_module);
+  if (conf->notes_enable) {
+    apr_table_set(r->notes, "WOOTHEE_NAME",
+                  apr_pstrdup(r->pool, woothee->name));
+    apr_table_set(r->notes, "WOOTHEE_OS",
+                  apr_pstrdup(r->pool, woothee->os));
+    apr_table_set(r->notes, "WOOTHEE_CATEGORY",
+                  apr_pstrdup(r->pool, woothee->category));
+    apr_table_set(r->notes, "WOOTHEE_OS_VERSION",
+                  apr_pstrdup(r->pool, woothee->os_version));
+    apr_table_set(r->notes, "WOOTHEE_VERSION",
+                  apr_pstrdup(r->pool, woothee->version));
+    apr_table_set(r->notes, "WOOTHEE_VENDOR",
+                  apr_pstrdup(r->pool, woothee->vendor));
+  }
 
-    /* ignore early headers in late calls */
-    if (!early && (envar == condition_early)) {
-      continue;
-    }
-    /* ignore late headers in early calls */
-    else if (early && (envar != condition_early)) {
-      continue;
-    }
-    /* Do we have an expression to evaluate? */
-    else if (hdr->expr != NULL) {
-      const char *err = NULL;
-      int eval = ap_expr_exec(r, hdr->expr, &err);
-      if (err) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01501)
-                      "Failed to evaluate expression (%s) - ignoring", err);
-      } else if (!eval) {
+  if (conf->header_enable) {
+    for (i = 0; i < fixup->nelts; ++i) {
+      header_entry *hdr = &((header_entry *) (fixup->elts))[i];
+      const char *envar = hdr->condition_var;
+
+      /* ignore early headers in late calls */
+      if (!early && (envar == condition_early)) {
         continue;
       }
-    }
-    /* Have any conditional envar-controlled Header processing to do? */
-    else if (envar && !early) {
-      if (*envar != '!') {
-        if (apr_table_get(r->subprocess_env, envar) == NULL) {
-          continue;
-        }
-      } else {
-        if (apr_table_get(r->subprocess_env, &envar[1]) != NULL) {
+      /* ignore late headers in early calls */
+      else if (early && (envar != condition_early)) {
+        continue;
+      }
+      /* Do we have an expression to evaluate? */
+      else if (hdr->expr != NULL) {
+        const char *err = NULL;
+        int eval = ap_expr_exec(r, hdr->expr, &err);
+        if (err) {
+          ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(01501)
+                        "Failed to evaluate expression (%s) - ignoring", err);
+        } else if (!eval) {
           continue;
         }
       }
-    }
+      /* Have any conditional envar-controlled Header processing to do? */
+      else if (envar && !early) {
+        if (*envar != '!') {
+          if (apr_table_get(r->subprocess_env, envar) == NULL) {
+            continue;
+          }
+        } else {
+          if (apr_table_get(r->subprocess_env, &envar[1]) != NULL) {
+            continue;
+          }
+        }
+      }
 
-    switch (hdr->action) {
-      case hdr_add:
-        apr_table_addn(headers, hdr->header,
-                       woothee_process_item(hdr, r, woothee));
-        break;
-      case hdr_append:
-        apr_table_mergen(headers, hdr->header,
-                         woothee_process_item(hdr, r, woothee));
-        break;
-      case hdr_merge:
-        val = apr_table_get(headers, hdr->header);
-        if (val == NULL) {
+      switch (hdr->action) {
+        case hdr_add:
           apr_table_addn(headers, hdr->header,
                          woothee_process_item(hdr, r, woothee));
-        } else {
-          char *new_val = woothee_process_item(hdr, r, woothee);
-          apr_size_t new_val_len = strlen(new_val);
-          int tok_found = 0;
+          break;
+        case hdr_append:
+          apr_table_mergen(headers, hdr->header,
+                           woothee_process_item(hdr, r, woothee));
+          break;
+        case hdr_merge:
+          val = apr_table_get(headers, hdr->header);
+          if (val == NULL) {
+            apr_table_addn(headers, hdr->header,
+                           woothee_process_item(hdr, r, woothee));
+          } else {
+            char *new_val = woothee_process_item(hdr, r, woothee);
+            apr_size_t new_val_len = strlen(new_val);
+            int tok_found = 0;
 
-          /* modified version of logic in ap_get_token() */
-          while (*val) {
-            const char *tok_start;
+            /* modified version of logic in ap_get_token() */
+            while (*val) {
+              const char *tok_start;
 
-            while (apr_isspace(*val)) {
-              ++val;
-            }
-            tok_start = val;
+              while (apr_isspace(*val)) {
+                ++val;
+              }
+              tok_start = val;
 
-            while (*val && *val != ',') {
-              if (*val++ == '"') {
-                while (*val) {
-                  if (*val++ == '"') {
-                    break;
+              while (*val && *val != ',') {
+                if (*val++ == '"') {
+                  while (*val) {
+                    if (*val++ == '"') {
+                      break;
+                    }
                   }
                 }
               }
+
+              if (new_val_len == (apr_size_t)(val - tok_start)
+                  && !strncmp(tok_start, new_val, new_val_len)) {
+                tok_found = 1;
+                break;
+              }
+
+              if (*val) {
+                ++val;
+              }
             }
 
-            if (new_val_len == (apr_size_t)(val - tok_start)
-                && !strncmp(tok_start, new_val, new_val_len)) {
-              tok_found = 1;
-              break;
-            }
-
-            if (*val) {
-              ++val;
+            if (!tok_found) {
+              apr_table_mergen(headers, hdr->header, new_val);
             }
           }
-
-          if (!tok_found) {
-            apr_table_mergen(headers, hdr->header, new_val);
-          }
-        }
-        break;
-      case hdr_set:
-        apr_table_setn(headers, hdr->header,
-                       woothee_process_item(hdr, r, woothee));
-        break;
-      case hdr_setifempty:
-        if (NULL == apr_table_get(headers, hdr->header)) {
+          break;
+        case hdr_set:
           apr_table_setn(headers, hdr->header,
                          woothee_process_item(hdr, r, woothee));
-        }
-        break;
-      case hdr_note:
-        apr_table_setn(r->notes, woothee_process_item(hdr, r, woothee),
-                       apr_table_get(headers, hdr->header));
-        break;
+          break;
+        case hdr_setifempty:
+          if (NULL == apr_table_get(headers, hdr->header)) {
+            apr_table_setn(headers, hdr->header,
+                           woothee_process_item(hdr, r, woothee));
+          }
+          break;
+        case hdr_note:
+          apr_table_setn(r->notes, woothee_process_item(hdr, r, woothee),
+                         apr_table_get(headers, hdr->header));
+          break;
+      }
     }
   }
 
-  if (woothee) {
-    woothee_delete(woothee);
-  }
+  woothee_delete(woothee);
 
   return 1;
 }
@@ -431,6 +480,12 @@ ap_woothee_early(request_rec *r)
 
 static const command_rec woothee_cmds[] =
 {
+  AP_INIT_FLAG("WootheeEnable",
+               notes_set, NULL, RSRC_CONF | OR_FILEINFO,
+               "set request notes by woothe"),
+  AP_INIT_FLAG("RequestHeaderForWootheeEnable",
+               header_set, NULL, RSRC_CONF | OR_FILEINFO,
+               "set request header by woothe"),
   AP_INIT_RAW_ARGS("RequestHeaderForWoothee",
                    header_cmd, &hdr_in, OR_FILEINFO,
                    "an action, header and item followed by optional env "
